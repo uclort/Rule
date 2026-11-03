@@ -1,0 +1,68 @@
+name: Sync upstream rules
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 每天 00:00 UTC = 北京时间 08:00
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/sync.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync & convert
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # SukkaW/Surge 的构建产物（即 ruleset.skk.moe 的内容）发布在 SukkaLab/ruleset.skk.moe
+      # List  -> Surge 格式；Clash -> Mihomo (Clash.Meta) 格式
+      - name: Fetch upstream build
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/SukkaLab/ruleset.skk.moe.git upstream
+          git -C upstream sparse-checkout set List Clash
+
+          for d in List/domainset List/non_ip List/ip Clash/domainset Clash/non_ip Clash/ip; do
+            test -d "upstream/$d" || { echo "::error::upstream/$d not found"; exit 1; }
+          done
+          surge_count=$(find upstream/List -name '*.conf' | wc -l)
+          clash_count=$(find upstream/Clash -name '*.txt' | wc -l)
+          echo "Surge files: $surge_count, Mihomo files: $clash_count"
+          if [ "$surge_count" -lt 50 ] || [ "$clash_count" -lt 50 ]; then
+            echo "::error::upstream looks incomplete, abort to keep previous rules"
+            exit 1
+          fi
+
+          echo "DIST_SHA=$(git -C upstream rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$(git ls-remote https://github.com/SukkaW/Surge.git refs/heads/master | cut -c1-7)" >> "$GITHUB_ENV"
+
+      - name: Sync Surge & Mihomo
+        run: |
+          rsync -a --delete upstream/List/ Surge/
+          rsync -a --delete upstream/Clash/ Mihomo/
+          cp upstream/LICENSE LICENSE
+
+      - name: Convert Shadowrocket
+        run: python3 scripts/convert_shadowrocket.py Surge Shadowrocket
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A Surge Mihomo Shadowrocket LICENSE
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git commit -m "chore: sync SukkaW/Surge@${SOURCE_SHA} (dist ${DIST_SHA}) $(TZ=Asia/Shanghai date '+%F %T')"
+          git push
