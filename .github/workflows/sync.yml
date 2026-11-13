@@ -24,13 +24,43 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # SukkaW/Surge 的构建产物（即 ruleset.skk.moe 的内容）发布在 SukkaLab/ruleset.skk.moe
-      # List  -> Surge 格式；Clash -> Mihomo (Clash.Meta) 格式
+      # SukkaW/Surge 的构建产物（即 ruleset.skk.moe 的内容）发布在 SukkaLab/ruleset.skk.moe，
+      # List -> Surge 格式；Clash -> Mihomo (Clash.Meta) 格式。
+      # 上游每月 12 号会把 dist 仓库临时切成 private 再切回 public，若那一步失败仓库会一直停在
+      # private，匿名克隆直接 404（表现为 "could not read Username for 'https://github.com'"）。
+      # 因此克隆失败时回退到 ruleset.skk.moe 站点：它是同一份内容的 GitHub Pages，
+      # 首页列出全部文件链接，可据此补齐完整目录树。
       - name: Fetch upstream build
         run: |
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/SukkaLab/ruleset.skk.moe.git upstream
-          git -C upstream sparse-checkout set List Clash
+          cloned=0
+          if GIT_TERMINAL_PROMPT=0 git clone --depth 1 --filter=blob:none --sparse \
+               https://github.com/SukkaLab/ruleset.skk.moe.git upstream; then
+            if git -C upstream sparse-checkout set List Clash \
+               && [ -d upstream/List ] && [ -d upstream/Clash ]; then
+              cloned=1
+              echo "DIST_SHA=$(git -C upstream rev-parse --short HEAD)" >> "$GITHUB_ENV"
+            else
+              echo "::warning::dist repo cloned but List/Clash missing, falling back to website"
+            fi
+          fi
+
+          if [ "$cloned" -ne 1 ]; then
+            rm -rf upstream
+            echo "::warning::dist repo unavailable (private/deleted upstream), mirroring https://ruleset.skk.moe instead"
+            mkdir -p upstream
+            curl -fsS -m 30 --retry 3 --retry-delay 2 https://ruleset.skk.moe/ -o upstream-index.html
+            grep -oE 'href="/(List|Clash)/[^"]+"' upstream-index.html \
+              | sed 's/href="//;s/"//' | sort -u > upstream-files.txt
+            echo "Index lists $(wc -l < upstream-files.txt) files"
+            while read -r path; do
+              mkdir -p "upstream/$(dirname "${path#/}")"
+              curl -fsS -m 30 --retry 3 --retry-delay 2 "https://ruleset.skk.moe$path" \
+                -o "upstream/${path#/}"
+            done < upstream-files.txt
+            curl -fsS -m 30 --retry 3 "https://ruleset.skk.moe/LICENSE" -o upstream/LICENSE || true
+            echo "DIST_SHA=website" >> "$GITHUB_ENV"
+            echo "::warning::synced from ruleset.skk.moe website, not the dist repo"
+          fi
 
           for d in List/domainset List/non_ip List/ip Clash/domainset Clash/non_ip Clash/ip; do
             test -d "upstream/$d" || { echo "::error::upstream/$d not found"; exit 1; }
@@ -43,8 +73,7 @@ jobs:
             exit 1
           fi
 
-          echo "DIST_SHA=$(git -C upstream rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "SOURCE_SHA=$(git ls-remote https://github.com/SukkaW/Surge.git refs/heads/master | cut -c1-7)" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$(git ls-remote https://github.com/SukkaW/Surge.git refs/heads/master | cut -c1-7 || true)" >> "$GITHUB_ENV"
 
       - name: Sync Surge & Mihomo
         run: |
